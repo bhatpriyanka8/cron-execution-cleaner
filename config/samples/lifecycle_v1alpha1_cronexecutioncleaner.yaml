@@ -1,12 +1,29 @@
 apiVersion: lifecycle.github.io/v1alpha1
 kind: CronExecutionCleaner
 metadata:
-  labels:
-    app.kubernetes.io/name: cronexecutioncleaner
-    app.kubernetes.io/instance: cronexecutioncleaner-sample
-    app.kubernetes.io/part-of: cron-execution-cleaner
-    app.kubernetes.io/managed-by: kustomize
-    app.kubernetes.io/created-by: cron-execution-cleaner
-  name: cronexecutioncleaner-sample
+  name: sample-cron-execution-cleaner
 spec:
-  # TODO(user): Add fields here
+  # Namespace where the target CronJob exists
+  namespace: default
+
+  # Name of the CronJob whose executions should be cleaned
+  cronJobName: example-cronjob
+
+  # Retention policy for completed Jobs
+  retain:
+    # Number of successful Jobs to keep
+    successfulJobs: 3
+
+    # Number of failed Jobs to keep
+    failedJobs: 3
+
+  # Configuration for cleaning stuck Jobs
+  cleanupStuck:
+    # Enable cleanup of long-running (stuck) Jobs
+    enabled: true
+
+    # Duration after which a running Job is considered stuck
+    stuckAfter: 2h
+
+  # How often the cleanup logic should run
+  runInterval: 5m
