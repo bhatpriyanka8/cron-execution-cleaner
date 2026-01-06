@@ -1,0 +1,32 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - lifecycle.github.io
+  resources:
+  - cronexecutioncleaners
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - lifecycle.github.io
+  resources:
+  - cronexecutioncleaners/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - lifecycle.github.io
+  resources:
+  - cronexecutioncleaners/status
+  verbs:
+  - get
+  - patch
+  - update
