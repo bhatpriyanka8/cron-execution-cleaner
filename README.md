@@ -1,19 +1,151 @@
-# cron-execution-cleaner
-// TODO(user): Add simple overview of use/purpose
+# Cron Execution Cleaner Operator
+A Kubernetes operator that automatically cleans up stuck and excess CronJob executions
+(Jobs and Pods) based on user-defined lifecycle policies.
+
+This project was built from a real production issue where CronJob executions entered error
+or hung states and were never cleaned up, leading to unbounded Jobs and Pods in the cluster.
 
 ## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+
+### Problem
+
+Kubernetes CronJobs create a new Job (and Pod) on every schedule.
+While Kubernetes provides basic history limits, it does not handle:
+
+- Long-running or hung Jobs
+- Executions stuck in Active state
+- Fine-grained retention policies
+- Explicit lifecycle cleanup semantics
+
+Over time, this leads to:
+
+- Orphaned Jobs
+- Accumulating Pods
+- Wasted cluster resources
+
+### Solution
+
+The Cron Execution Cleaner Operator introduces a Custom Resource,
+CronExecutionCleaner, that allows users to define explicit lifecycle policies
+for CronJob executions.
+
+#### The controller:
+
+- Watches cleanup policies via a CRD
+- Lists Jobs using informer-backed caches
+- Filters Jobs using ownership (CronJob → Job → Pod)
+- Detects stuck executions using time-based rules
+- Enforces retention limits for completed Jobs
+- Deletes Jobs safely with cascading Pod cleanup
+- Reports actions via CR status
+
+### High-Level Architecture
+The operator follows a standard Kubernetes reconcile pattern driven by a
+custom resource that defines cleanup policies.
+
+```mermaid
+flowchart TD
+    CR[CronExecutionCleaner - CR]
+    CTRL[Controller - Reconcile Loop]
+    CACHE[Informer Cache - Jobs and Pods]
+    OWN[Filter by Ownership]
+    STUCK[Detect Stuck Jobs - Time Based]
+    RETAIN[Apply Retention Policy - Count Based]
+    DELETE[Delete Jobs via Background Propagation]
+    STATUS[Update CR Status]
+
+    CR --> CTRL
+    CTRL --> CACHE
+    CACHE --> OWN
+    OWN --> STUCK
+    OWN --> RETAIN
+    STUCK --> DELETE
+    RETAIN --> DELETE
+    DELETE --> STATUS
+
+```
+### Custom Resource Example
+```yaml
+apiVersion: lifecycle.github.io/v1alpha1
+kind: CronExecutionCleaner
+metadata:
+  name: stuck-cron-cleaner
+spec:
+  namespace: cron-test
+  cronJobName: stuck-cron
+
+  retain:
+    successfulJobs: 3
+    failedJobs: 3
+
+  cleanupStuck:
+    enabled: true
+    stuckAfter: 2h
+
+  runInterval: 5m
+```
+### How “Stuck” Jobs Are Detected
+
+A Job is considered stuck if all of the following are true:
+
+- `status.active` > 0
+- `status.succeeded` == 0
+- `status.failed` == 0
+- The Job has been running longer than `cleanupStuck.stuckAfter`
+
+This logic relies on Job controller semantics (`status.startTime`) rather than
+Pod-level heuristics.
+
+### Retention Policy
+
+For completed Jobs:
+
+- Keep the **N most recent successful Jobs**
+- Keep the **M most recent failed Jobs**
+- Delete older executions (oldest first)
+
+Retention is enforced independently from stuck-job cleanup.
+
+### Status Reporting
+
+The operator updates the `CronExecutionCleaner` status with:
+
+- `lastRunTime`
+
+- `jobsDeleted`
+
+- `podsDeleted`
+
+This provides visibility into cleanup actions and makes the operator easy to observe
+and debug.
+
+### Safety Guarantees
+
+- Namespace-scoped
+- CronJob-scoped
+- Ownership-based selection
+- No cluster-wide deletions
+- Explicit retention and timeout policies
+- Cascading deletion handled by Kubernetes
 
 ## Getting Started
 
 ### Prerequisites
-- go version v1.21.0+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
+- Go v1.21+
+- Docker
+- kubectl
+- Access to a Kubernetes cluster(Kind, Minikube, etc.)
+- Kubebuilder
 
-### To Deploy on the cluster
-**Build and push your image to the location specified by `IMG`:**
+### Run Locally (Recommended for Development)
+Run the controller locally against your kubeconfig:
+```sh
+make install
+make run
+```
+
+### Deploy to a Cluster
+**Build and push the controller image:**
 
 ```sh
 make docker-build docker-push IMG=<some-registry>/cron-execution-cleaner:tag
@@ -29,7 +161,7 @@ Make sure you have the proper permission to the registry if the above commands d
 make install
 ```
 
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
+**Deploy the controller**
 
 ```sh
 make deploy IMG=<some-registry>/cron-execution-cleaner:tag
@@ -38,7 +170,7 @@ make deploy IMG=<some-registry>/cron-execution-cleaner:tag
 > **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin 
 privileges or be logged in as admin.
 
-**Create instances of your solution**
+**Create Cleaner Resource**
 You can apply the samples (examples) from the config/sample:
 
 ```sh
@@ -47,7 +179,7 @@ kubectl apply -k config/samples/
 
 >**NOTE**: Ensure that the samples has default values to test it out.
 
-### To Uninstall
+### Cleanup / Uninstall
 **Delete the instances (CRs) from the cluster:**
 
 ```sh
@@ -66,49 +198,25 @@ make uninstall
 make undeploy
 ```
 
-## Project Distribution
+## Future Roadmap
 
-Following are the steps to build the installer and distribute this project to users.
-
-1. Build the installer for the image built and published in the registry:
-
-```sh
-make build-installer IMG=<some-registry>/cron-execution-cleaner:tag
-```
-
-NOTE: The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without
-its dependencies.
-
-2. Using the installer
-
-Users can just run kubectl apply -f <URL for YAML BUNDLE> to install the project, i.e.:
-
-```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/cron-execution-cleaner/<tag or branch>/dist/install.yaml
-```
+- Finalizers
+- Prometheus Metrics
+- Dry-run mode
+- Helm chart
+- Unit and e2e tests
+- Support for multiple CronJobs per CR
 
 ## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
+Contributions are welcome.
+Please:
+
+- Open an issue to discuss changes
+- Keep PRs focused and well-scoped
+- Follow existing controller patterns
 
 **NOTE:** Run `make help` for more information on all potential `make` targets
 
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
-
 ## License
 
-Copyright 2026.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-
+MIT
