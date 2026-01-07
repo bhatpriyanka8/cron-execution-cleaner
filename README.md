@@ -29,16 +29,6 @@ The Cron Execution Cleaner Operator introduces a Custom Resource,
 CronExecutionCleaner, that allows users to define explicit lifecycle policies
 for CronJob executions.
 
-#### The controller:
-
-- Watches cleanup policies via a CRD
-- Lists Jobs using informer-backed caches
-- Filters Jobs using ownership (CronJob → Job → Pod)
-- Detects stuck executions using time-based rules
-- Enforces retention limits for completed Jobs
-- Deletes Jobs safely with cascading Pod cleanup
-- Reports actions via CR status
-
 ### High-Level Architecture
 The operator follows a standard Kubernetes reconcile pattern driven by a
 custom resource that defines cleanup policies.
@@ -64,6 +54,15 @@ flowchart TD
     DELETE --> STATUS
 
 ```
+
+### Deployment Architecture
+
+The operator is deployed to `cron-execution-cleaner-system` namespace but operates 
+on Jobs/Pods in **user-specified namespaces**. This provides:
+- Isolation: Operator cannot interfere with cluster system components
+- Multi-tenancy: Single operator instance manages multiple namespaces
+- Least privilege: Explicit RBAC for each namespace
+
 ### Custom Resource Example
 ```yaml
 apiVersion: lifecycle.github.io/v1alpha1
@@ -84,6 +83,25 @@ spec:
 
   runInterval: 5m
 ```
+
+#### The controller:
+
+- Watches cleanup policies via a CRD
+- Lists Jobs using informer-backed caches
+- Filters Jobs using ownership (CronJob → Job → Pod)
+- Detects stuck executions using time-based rules
+- Enforces retention limits for completed Jobs
+- Deletes Jobs safely with cascading Pod cleanup
+- Reports actions via CR status
+
+### Reconciliation Cycle
+
+The controller reconciles based on `spec.runInterval`. For example, with `runInterval: 5m`:
+- Cleanup check runs every 5 minutes
+- Between cycles, no cleanup occurs even if conditions are met
+- This prevents excessive API calls and provides predictable cleanup timing
+
+
 ### How “Stuck” Jobs Are Detected
 
 A Job is considered stuck if all of the following are true:
@@ -103,6 +121,8 @@ For completed Jobs:
 - Keep the **N most recent successful Jobs**
 - Keep the **M most recent failed Jobs**
 - Delete older executions (oldest first)
+
+**Important:** Jobs without `status.startTime` are treated as oldest and deleted first.
 
 Retention is enforced independently from stuck-job cleanup.
 
@@ -128,32 +148,57 @@ and debug.
 - Explicit retention and timeout policies
 - Cascading deletion handled by Kubernetes
 
+### Important: Cascading Deletion Behavior
+
+The operator uses Kubernetes' `DeletePropagationBackground` policy:
+- Jobs are deleted immediately
+- Associated Pods are cleaned up asynchronously
+- **WARNING**: Once a Job is deleted, there is no recovery mechanism. 
+Ensure your retention policies are appropriate before enabling cleanup.
+
+### Limitations
+
+- One `CronExecutionCleaner` resource per CronJob
+- Assumes 1:1 Job:Pod ratio
+- No dry-run mode available
+
 ## Getting Started
 
 ### Prerequisites
 - Go v1.21+
 - Docker
 - kubectl
+- Kubernetes: 1.26+
 - Access to a Kubernetes cluster(Kind, Minikube, etc.)
 - Kubebuilder
+
+### Resource Requirements
+
+The controller requires:
+- **CPU**: 10m (request) / 500m (limit)
+- **Memory**: 64Mi (request) / 128Mi (limit)
+
+See `config/manager/manager.yaml` for details.
 
 ### Run Locally (Recommended for Development)
 Run the controller locally against your kubeconfig:
 ```sh
+
+# Install the CRD (register the template)
+# This makes Kubernetes understand what a "CronExecutionCleaner" is
 make install
 make run
 ```
 
-### Deploy to a Cluster
+### Deploy to a Cluster (Optional, if you don't want to run the code locally)
 **Build and push the controller image:**
 
 ```sh
-make docker-build docker-push IMG=<some-registry>/cron-execution-cleaner:tag
+make docker-build docker-push IMG=<your-registry>/cron-execution-cleaner:tag
 ```
 
-**NOTE:** This image ought to be published in the personal registry you specified. 
-And it is required to have access to pull the image from the working environment. 
-Make sure you have the proper permission to the registry if the above commands don’t work.
+**NOTE:** Replace `<your-registry>` with your container registry (e.g., `docker.io/username`, `gcr.io/project-id`).
+Ensure you have push permissions to the registry.
 
 **Install the CRDs into the cluster:**
 
@@ -164,20 +209,69 @@ make install
 **Deploy the controller**
 
 ```sh
-make deploy IMG=<some-registry>/cron-execution-cleaner:tag
+make deploy IMG=<your-registry>/cron-execution-cleaner:tag
 ```
 
 > **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin 
 privileges or be logged in as admin.
 
-**Create Cleaner Resource**
-You can apply the samples (examples) from the config/sample:
+**Verify the controller is running:**
 
 ```sh
-kubectl apply -k config/samples/
+kubectl get deployment -n cron-execution-cleaner-system
+kubectl logs -n cron-execution-cleaner-system deployment/controller-manager
 ```
 
->**NOTE**: Ensure that the samples has default values to test it out.
+### Create Cleaner Resource
+First, review the sample configuration:
+
+```sh
+cat config/samples/lifecycle_v1alpha1_cronexecutioncleaner.yaml
+```
+
+Customize the sample if needed (namespace, cronJobName, retention policy, etc.), then apply:
+
+```sh
+# Create a CR (deploy an instance)
+kubectl apply -k config/samples/ 
+# Alternatively, kubectl apply -f config/samples/lifecycle_v1alpha1_cronexecutioncleaner.yaml
+```
+
+**Verify the resource was created:**
+
+```sh
+# List all CRs of this type
+kubectl get cronexecutioncleaner
+# Shows: stuck-cron-cleaner
+
+# Get a specific CR
+kubectl get cronexecutioncleaner stuck-cron-cleaner -o yaml
+# Shows the configuration and status of this specific instance
+```
+
+Wait for the next reconciliation cycle (based on `runInterval`) to see cleanup actions.
+
+### Status Example
+
+After one cycle runs, check the CR status:
+
+```sh
+kubectl get cronexecutioncleaner stuck-cron-cleaner -o yaml
+```
+
+Expected status output:
+```yaml
+status:
+  jobsDeleted: 5
+  podsDeleted: 5
+  lastRunTime: "2026-01-07T10:30:00Z"
+  conditions:
+  - type: Ready
+    status: "True"
+    reason: ReconcileSuccess
+    message: Cleanup executed successfully
+    lastTransitionTime: "2026-01-07T10:30:00Z"
+```
 
 ### Cleanup / Uninstall
 **Delete the instances (CRs) from the cluster:**
@@ -186,28 +280,103 @@ kubectl apply -k config/samples/
 kubectl delete -k config/samples/
 ```
 
-**Delete the APIs(CRDs) from the cluster:**
+**Delete the CRDs from the cluster:**
 
 ```sh
 make uninstall
 ```
 
-**UnDeploy the controller from the cluster:**
+**Undeploy the controller from the cluster:**
 
 ```sh
 make undeploy
 ```
+### Troubleshooting
+
+**Jobs not being deleted:**
+- Check controller logs: `kubectl logs -n cron-execution-cleaner-system deployment/controller-manager`
+- Verify RBAC: `kubectl auth can-i delete jobs --as=system:serviceaccount:cron-execution-cleaner-system:controller-manager`
+- Confirm Job ownership: `kubectl get jobs -o jsonpath='{.items[*].metadata.ownerReferences}'`
+
+**Controller pod not running:**
+- Insufficient RBAC permissions
+- CRD not installed: `make install`
+
+---
+
+## E2E Testing (Kind)
+
+The project includes end-to-end (e2e) tests generated using Kubebuilder.
+These tests create and manage a Kind cluster automatically and validate the controller behavior against a real Kubernetes API.
+
+This is the recommended and easiest way to run e2e tests locally.
+
+### Prerequisites
+
+Make sure the following tools are installed:
+
+- Go (1.21+)
+- Docker
+- kubectl
+- Kind
+- Kubebuilder
+
+**Verify:**
+
+```sh
+docker version
+kubectl version --client
+kind version
+kubebuilder version
+```
+
+**Step 1: Create a Kind cluster named `kind`**
+
+```sh
+kind create cluster --name kind
+```
+**Verify:**
+
+```sh
+kubectl cluster-info
+```
+
+**Step 2: Run the e2e tests**
+
+From the repository root:
+
+```sh
+go test ./test/e2e -tags=e2e -v
+```
+
+**What this does:**
+
+- Builds the controller image
+- Loads the image into the Kind cluster
+- Installs CRDs
+- Deploys the controller
+- Creates test resources
+- Validates reconcile behavior
+- Cleans up automatically
+
+**Step 3: Clean up (optional)**
+
+Delete the Kind cluster when done:
+
+```sh
+kind delete cluster --name kind
+```
 
 ## Future Roadmap
 
-- Finalizers
 - Prometheus Metrics
-- Dry-run mode
+- Dry-run mode (validate policies without deletion)
 - Helm chart
-- Unit and e2e tests
 - Support for multiple CronJobs per CR
+- Finalizers for CR cleanup on deletion
 
 ## Contributing
+
 Contributions are welcome.
 Please:
 
