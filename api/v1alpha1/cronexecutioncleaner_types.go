@@ -28,13 +28,12 @@ type CronExecutionCleanerSpec struct {
 	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
 
-	// Foo is an example field of CronExecutionCleaner. Edit cronexecutioncleaner_types.go to remove/update
-	Foo string `json:"foo,omitempty"`
-
-	// Namespace in which the target CronJob exists
+	// Namespace in which the target the CronJob exists
+	// +kubebuilder:validation:MinLength=1
 	Namespace string `json:"namespace"`
 
 	// Name of the CronJob whose executions should be cleaned
+	// +kubebuilder:validation:MinLength=1
 	CronJobName string `json:"cronJobName"`
 
 	// Retention policy for completed Jobs
@@ -60,6 +59,9 @@ type CronExecutionCleanerStatus struct {
 
 	// Total number of Pods deleted
 	PodsDeleted int `json:"podsDeleted,omitempty"`
+
+	// Current state of the cleaner
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
 //+kubebuilder:object:root=true
@@ -85,9 +87,11 @@ type CronExecutionCleanerList struct {
 
 type RetentionPolicy struct {
 	// Number of successful Jobs to retain
+	// +kubebuilder:validation:Minimum=0
 	SuccessfulJobs int `json:"successfulJobs"`
 
 	// Number of failed Jobs to retain
+	// +kubebuilder:validation:Minimum=0
 	FailedJobs int `json:"failedJobs"`
 }
 

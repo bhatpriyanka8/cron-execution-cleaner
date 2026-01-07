@@ -22,8 +22,10 @@ import (
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -34,12 +36,18 @@ import (
 // CronExecutionCleanerReconciler reconciles a CronExecutionCleaner object
 type CronExecutionCleanerReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme   *runtime.Scheme
+	Recorder record.EventRecorder
 }
 
-//+kubebuilder:rbac:groups=lifecycle.github.io,resources=cronexecutioncleaners,verbs=get;list;watch;create;update;patch;delete
+// RBAC permissions
+//+kubebuilder:rbac:groups=lifecycle.github.io,resources=cronexecutioncleaners,verbs=get;list;watch
 //+kubebuilder:rbac:groups=lifecycle.github.io,resources=cronexecutioncleaners/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=lifecycle.github.io,resources=cronexecutioncleaners/finalizers,verbs=update
+
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;delete
+
+// +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -53,7 +61,6 @@ type CronExecutionCleanerReconciler struct {
 func (r *CronExecutionCleanerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	_ = log.FromContext(ctx)
 
-	// TODO(user): your logic here
 	log := ctrl.LoggerFrom(ctx)
 	log.Info("Reconciling CronExecutionCleaner", "name", req.NamespacedName)
 
@@ -62,6 +69,37 @@ func (r *CronExecutionCleanerReconciler) Reconcile(ctx context.Context, req ctrl
 		log.Error(err, "unable to fetch CronExecutionCleaner")
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+
+	if err := r.validateSpec(ctx, &cleaner); err != nil {
+		log.Error(err, "Invalid CronExecutionCleaner spec, skipping reconciliation", "name", req.NamespacedName)
+		// record event
+		r.Recorder.Event(
+			&cleaner,
+			corev1.EventTypeWarning,
+			"InvalidSpec",
+			err.Error(),
+		)
+
+		setCondition(
+			&cleaner,
+			"Ready",
+			metav1.ConditionFalse,
+			"InvalidSpec",
+			err.Error(),
+		)
+
+		_ = r.Status().Update(ctx, &cleaner)
+		return ctrl.Result{}, nil
+	}
+
+	log.Info(
+		"Loaded CronExecutionCleaner spec",
+		"Namespace", cleaner.Spec.Namespace,
+		"CronJobName", cleaner.Spec.CronJobName,
+		"Retain", cleaner.Spec.Retain,
+		"CleanupStuck", cleaner.Spec.CleanupStuck,
+		"RunInterval", cleaner.Spec.RunInterval,
+	)
 
 	log.Info(
 		"Loaded CronExecutionCleaner spec",
@@ -297,6 +335,16 @@ func (r *CronExecutionCleanerReconciler) Reconcile(ctx context.Context, req ctrl
 			}
 		}
 	}
+	setCondition(
+		&cleaner,
+		"Ready",
+		metav1.ConditionTrue,
+		"ReconcileSuccess",
+		"Cleanup executed successfully",
+	)
+
+	_ = r.Status().Update(ctx, &cleaner)
+
 	return ctrl.Result{
 		RequeueAfter: cleaner.Spec.RunInterval.Duration,
 	}, nil
@@ -304,6 +352,7 @@ func (r *CronExecutionCleanerReconciler) Reconcile(ctx context.Context, req ctrl
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *CronExecutionCleanerReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	r.Recorder = mgr.GetEventRecorderFor("cronexecutioncleaner")
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&lifecyclev1alpha1.CronExecutionCleaner{}).
 		Complete(r)
