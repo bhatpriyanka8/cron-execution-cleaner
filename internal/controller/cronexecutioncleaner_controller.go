@@ -18,7 +18,6 @@ package controller
 
 import (
 	"context"
-	"sort"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -70,7 +69,7 @@ func (r *CronExecutionCleanerReconciler) Reconcile(ctx context.Context, req ctrl
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	if err := r.validateSpec(ctx, &cleaner); err != nil {
+	if err := validateSpec(ctx, &cleaner); err != nil {
 		log.Error(err, "Invalid CronExecutionCleaner spec, skipping reconciliation", "name", req.NamespacedName)
 		// record event
 		r.Recorder.Event(
@@ -101,78 +100,36 @@ func (r *CronExecutionCleanerReconciler) Reconcile(ctx context.Context, req ctrl
 		"RunInterval", cleaner.Spec.RunInterval,
 	)
 
-	log.Info(
-		"Loaded CronExecutionCleaner spec",
-		"Namespace", cleaner.Spec.Namespace,
-		"CronJobName", cleaner.Spec.CronJobName,
-		"Retain", cleaner.Spec.Retain,
-		"CleanupStuck", cleaner.Spec.CleanupStuck,
-		"RunInterval", cleaner.Spec.RunInterval,
-	)
-
 	var jobList batchv1.JobList
 
-	err := r.List(
-		ctx,
-		&jobList, client.InNamespace(cleaner.Spec.Namespace),
-	)
+	err := r.List(ctx, &jobList, client.InNamespace(cleaner.Spec.Namespace))
 	if err != nil {
 		log.Error(err, "unable to list Jobs for CronExecutionCleaner")
 		return ctrl.Result{}, err
 	}
 
-	ownedJobs := []batchv1.Job{}
-
-	for _, job := range jobList.Items {
-		for _, owner := range job.OwnerReferences {
-			if owner.Kind == "CronJob" && owner.Name == cleaner.Spec.CronJobName {
-				ownedJobs = append(ownedJobs, job)
-				break
-			}
-		}
-	}
+	ownedJobs := filterJobsByOwner(jobList.Items, cleaner.Spec.CronJobName)
 	log.Info(
 		"Found Jobs owned by CronJob",
 		"cronJob", cleaner.Spec.CronJobName,
 		"count", len(ownedJobs),
 	)
 
-	activeJobs := []batchv1.Job{}
-	succeededJobs := []batchv1.Job{}
-	failedJobs := []batchv1.Job{}
-
-	for _, job := range ownedJobs {
-		switch {
-		case job.Status.Active > 0:
-			activeJobs = append(activeJobs, job)
-
-		case job.Status.Succeeded > 0:
-			succeededJobs = append(succeededJobs, job)
-
-		case job.Status.Failed > 0:
-			failedJobs = append(failedJobs, job)
-		}
-	}
+	activeJobs, succeededJobs, failedJobs := classifyJobs(ownedJobs)
 	log.Info(
 		"Job classification",
 		"active", len(activeJobs),
 		"succeeded", len(succeededJobs),
 		"failed", len(failedJobs),
 	)
+
 	stuckJobs := []batchv1.Job{}
+	deletedCount := 0
+
 	if cleaner.Spec.CleanupStuck.Enabled {
 		now := time.Now()
 		stuckAfter := cleaner.Spec.CleanupStuck.StuckAfter.Duration
-
-		for _, job := range activeJobs {
-			if job.Status.StartTime == nil {
-				continue
-			}
-
-			if now.Sub(job.Status.StartTime.Time) > stuckAfter {
-				stuckJobs = append(stuckJobs, job)
-			}
-		}
+		stuckJobs = detectStuckJobs(activeJobs, stuckAfter, now)
 
 		log.Info(
 			"Stuck job detection",
@@ -180,160 +137,43 @@ func (r *CronExecutionCleanerReconciler) Reconcile(ctx context.Context, req ctrl
 			"stuckAfter", stuckAfter.String(),
 			"count", len(stuckJobs),
 		)
+		deletedCount += r.deleteJobs(ctx, stuckJobs, "stuck")
 
 		// Retention logic for succeeded jobs
-		sort.Slice(succeededJobs, func(i, j int) bool {
-			if succeededJobs[i].Status.StartTime == nil {
-				return false
-			}
-			if succeededJobs[j].Status.StartTime == nil {
-				return true
-			}
-			return succeededJobs[i].Status.StartTime.After(
-				succeededJobs[j].Status.StartTime.Time,
-			)
-		})
-
-		retainSucceeded := cleaner.Spec.Retain.SuccessfulJobs
-		excessSucceeded := []batchv1.Job{}
-
-		if len(succeededJobs) > retainSucceeded {
-			excessSucceeded = succeededJobs[retainSucceeded:]
-		}
+		excessSucceeded := excessJobs(succeededJobs, cleaner.Spec.Retain.SuccessfulJobs)
 
 		log.Info(
 			"Succeeded job retention evaluation",
-			"retain", retainSucceeded,
+			"retain", cleaner.Spec.Retain.SuccessfulJobs,
 			"total", len(succeededJobs),
 			"excess", len(excessSucceeded),
 		)
+		deletedCount += r.deleteJobs(ctx, excessSucceeded, "succeeded")
 
 		// Retention logic for failed jobs
-		sort.Slice(failedJobs, func(i, j int) bool {
-			if failedJobs[i].Status.StartTime == nil {
-				return false
-			}
-			if failedJobs[j].Status.StartTime == nil {
-				return true
-			}
-			return failedJobs[i].Status.StartTime.After(
-				failedJobs[j].Status.StartTime.Time,
-			)
-		})
-
-		retainFailed := cleaner.Spec.Retain.FailedJobs
-		excessFailed := []batchv1.Job{}
-
-		if len(failedJobs) > retainFailed {
-			excessFailed = failedJobs[retainFailed:]
-		}
+		excessFailed := excessJobs(failedJobs, cleaner.Spec.Retain.FailedJobs)
 
 		log.Info(
 			"Failed job retention evaluation",
-			"retain", retainFailed,
+			"retain", cleaner.Spec.Retain.FailedJobs,
 			"total", len(failedJobs),
 			"excess", len(excessFailed),
 		)
+		deletedCount += r.deleteJobs(ctx, excessFailed, "failed")
 
-		if len(stuckJobs) > 0 {
-			deletedJobs := 0
-
-			for _, job := range stuckJobs {
-				log.Info(
-					"Deleting stuck Job",
-					"job", job.Name,
-				)
-
-				policy := metav1.DeletePropagationBackground
-
-				if err := r.Delete(
-					ctx,
-					&job,
-					&client.DeleteOptions{
-						PropagationPolicy: &policy,
-					},
-				); err != nil {
-					log.Error(err, "Failed to delete stuck Job", "job", job.Name)
-					return ctrl.Result{}, err
-				}
-
-				deletedJobs++
-			}
-			if deletedJobs > 0 {
-				now := metav1.Now()
-
-				cleaner.Status.LastRunTime = &now
-				cleaner.Status.JobsDeleted += deletedJobs
-				cleaner.Status.PodsDeleted += deletedJobs // 1 pod per job in our setup
-
-				if err := r.Status().Update(ctx, &cleaner); err != nil {
-					log.Error(err, "Failed to update CronExecutionCleaner status")
-					return ctrl.Result{}, err
-				}
-			}
-		}
-		deletedSucceeded := 0
-
-		for _, job := range excessSucceeded {
-			log.Info(
-				"Deleting excess succeeded Job",
-				"job", job.Name,
-			)
-
-			policy := metav1.DeletePropagationBackground
-
-			if err := r.Delete(
-				ctx,
-				&job,
-				&client.DeleteOptions{
-					PropagationPolicy: &policy,
-				},
-			); err != nil {
-				log.Error(err, "Failed to delete succeeded Job", "job", job.Name)
-				return ctrl.Result{}, err
-			}
-
-			deletedSucceeded++
-		}
-
-		deletedFailed := 0
-
-		for _, job := range excessFailed {
-			log.Info(
-				"Deleting excess failed Job",
-				"job", job.Name,
-			)
-
-			policy := metav1.DeletePropagationBackground
-
-			if err := r.Delete(
-				ctx,
-				&job,
-				&client.DeleteOptions{
-					PropagationPolicy: &policy,
-				},
-			); err != nil {
-				log.Error(err, "Failed to delete failed Job", "job", job.Name)
-				return ctrl.Result{}, err
-			}
-
-			deletedFailed++
-		}
-
-		totalDeleted := deletedSucceeded + deletedFailed
-
-		if totalDeleted > 0 {
+		if deletedCount > 0 {
 			now := metav1.Now()
 
 			cleaner.Status.LastRunTime = &now
-			cleaner.Status.JobsDeleted += totalDeleted
-			cleaner.Status.PodsDeleted += totalDeleted
+			cleaner.Status.JobsDeleted += deletedCount
+			cleaner.Status.PodsDeleted += deletedCount // 1 pod per job in our setup
 
 			if err := r.Status().Update(ctx, &cleaner); err != nil {
 				log.Error(err, "Failed to update CronExecutionCleaner status")
 				return ctrl.Result{}, err
 			}
 		}
+		log.Info("Cleanup summary", "totalDeleted", deletedCount)
 	}
 	setCondition(
 		&cleaner,
