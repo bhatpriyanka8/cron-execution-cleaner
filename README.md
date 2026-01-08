@@ -1,7 +1,7 @@
 # Cron Execution Cleaner Operator
 
-![CI](https://github.com/bhatpriyanka8/cron-execution-cleaner/actions/workflows/ci.yml/badge.svg)
-![Go Version](https://img.shields.io/badge/go-1.22+-blue)
+[![CI](https://github.com/bhatpriyanka8/cron-execution-cleaner/actions/workflows/ci.yaml/badge.svg)](ttps://github.com/bhatpriyanka8/cron-execution-cleaner/actions/workflows/ci.yaml)
+![Go Version](https://img.shields.io/badge/go-1.21+-blue)
 ![License](https://img.shields.io/github/license/bhatpriyanka8/cron-execution-cleaner)
 ![Kubebuilder](https://img.shields.io/badge/kubebuilder-based-blueviolet)
 
